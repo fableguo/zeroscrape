@@ -37,11 +37,78 @@ memory_router = MemoryRouter(db_client)
 dom_cleaner = DOMCleaner()
 
 
+# Playwright-only CSS pseudo-classes that BeautifulSoup's soupsieve rejects but
+# the Playwright execution engine actually supports (e.g. `:has()`, `:text-is()`).
+_PW_PSEUDO_NAMES = (
+    r"text-is|text-matches|text|nth-match|has|"
+    r"below|above|right-of|left-of|near|focus-within"
+)
+
+
+def _strip_pw_pseudo_classes(selector: str) -> str:
+    """Remove Playwright-only pseudo-classes with balanced parentheses.
+
+    soupsieve does not understand `:has()`, `:text-is()`, etc., and they may
+    nest (e.g. `:has(> span:text-is("漲跌"))`). A naive `[^)]*` match breaks on
+    the first inner `)`, leaving a dangling `)`. We walk the string tracking
+    parenthesis depth and delete each `:name(` ... matching `)` span.
+    """
+    names = _PW_PSEUDO_NAMES
+    result = []
+    i = 0
+    n = len(selector)
+    while i < n:
+        if (
+            selector[i] == ":"
+            and i + 1 < n
+            and selector[i + 1] not in "(#.[>~+* \t\n"
+        ):
+            rest = selector[i + 1:]
+            m = re.match(names, rest)
+            if m:
+                j = i + 1 + len(m.group(0))
+                while j < n and selector[j] in " \t":
+                    j += 1
+                if j < n and selector[j] == "(":
+                    depth = 0
+                    k = j
+                    while k < n:
+                        if selector[k] == "(":
+                            depth += 1
+                        elif selector[k] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k += 1
+                    i = k + 1 if k < n else n
+                    continue
+        result.append(selector[i])
+        i += 1
+    return "".join(result)
+
+
 def _validate_selector_syntax(selector: str) -> bool:
-    """Dry-run test to ensure a CSS selector is syntactically valid."""
+    """Dry-run test to ensure a CSS selector is syntactically valid.
+
+    Uses BeautifulSoup for standard CSS, but tolerates Playwright-only
+    pseudo-classes (e.g. `:has()`, `:text-is()`) that the real execution
+    engine (Playwright) understands but soupsieve does not. We strip those
+    constructs and re-test the remaining structural selector so valid
+    Playwright selectors are not falsely rejected.
+    """
+    if not selector or not selector.strip():
+        return False
     try:
         mock_soup = BeautifulSoup("<div><span></span></div>", "html.parser")
         mock_soup.select_one(selector)
+        return True
+    except Exception:
+        pass
+    # Strip Playwright-only pseudo-classes, then re-test the residual structure.
+    normalized = _strip_pw_pseudo_classes(selector).replace(">>>", " ")
+    try:
+        mock_soup = BeautifulSoup("<div><span></span></div>", "html.parser")
+        mock_soup.select_one(normalized)
         return True
     except Exception:
         return False
